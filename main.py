@@ -1,6 +1,7 @@
 import numpy as np 
 import torch 
 from pathlib import Path
+import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer
@@ -106,7 +107,8 @@ model = AutoModel.from_pretrained(
   model_id, 
   torch_dtype=torch.bfloat16, 
   # low_cpu_mem_usage=True, 
-  use_flash_attn=True, 
+  # out attentions just works without flash attention 
+  use_flash_attn=False, 
   trust_remote_code=True,
 )
 model = model.to(device)
@@ -118,42 +120,86 @@ tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_
 test_image_path = "assets/rechnung_001.png"
 pixel_values = load_image(test_image_path, max_num=12).to(torch.bfloat16)
 pixel_values = pixel_values.to(device)
-generation_config = dict(max_new_tokens=1024, do_sample=False)
-print(f"Image pixel values shape: {pixel_values.shape}")
-question = "<image>\nDescribe the document." 
-response, history = model.chat(
+generation_config = dict(
+  max_new_tokens=1024, 
+  do_sample=False,
+  output_attentions=True, 
+  output_logits=True,
+  return_dict_in_generate=True,
+)
+
+question = "<image>\nBitte gib mir die Rechnungsnummer." 
+response, history, generation_output, model_inputs = model.chat(
   tokenizer, pixel_values, question, generation_config, history=None, return_history=True, verbose=True
 )
 print(f"User: {question}\nAssistant: {response}")
 
-# IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
-# num_patches_list = [pixel_values.shape[0]] if pixel_values is not None else []
-# img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-# model.img_context_token_id = img_context_token_id
 
-# # template = get
+aggregated_attentions = []
+for attention in generation_output.attentions: 
+  averaged_attn = []
+  for layer in attention: 
+    layer_attns = layer.squeeze(0)
+    attns_per_head = layer_attns.mean(dim=0)
+    vector = torch.concat((
+      # zero the first entry: null attention 
+      torch.tensor([0.]).to(device), 
+      # usually there is just one item in attns_per_head
+      # but on the first generation there is a row for each token 
+      # in the prompt as well, so take -1
+      attns_per_head[-1][1:],
+      # add zero for the final generated token, which never gets any attention 
+      torch.tensor([0.]).to(device)
+    )) 
+    averaged_attn.append(vector / vector.sum())
 
-# model_inputs = tokenizer(query, return_tensors='pt')
-# input_ids = model_inputs['input_ids'].to(device)
-# attention_mask = model_inputs['attention_mask'].to(device)
-# generation_config['eos_token_id'] = eos_token_id
+  aggregated_attention = torch.stack(averaged_attn).mean(dim=0)
+  aggregated_attentions.append(aggregated_attention)
 
-# result = model.generate(
-#   pixel_values=pixel_values,
-#   input_ids=input_ids,
-#   attention_mask=attention_mask,
-#   visual_features=None,
-#   generation_config=generation_config,
-#   output_hidden_states=True,
-#   return_dict=True,
-# )
+# now pad and stack the attentions 
+max_len = max([v.shape[0] for v in aggregated_attentions])
 
-# print(result)
+# add prompt attentions
+prompt_attention = [
+  torch.tensor(
+    [1 if i == j else 0 for j, _ in enumerate(model_inputs['input_ids'][0])]
+    ).to(device) 
+  for i, _ in enumerate(model_inputs['input_ids'][0])
+]
 
+attentions = prompt_attention + aggregated_attentions
 
+padded_attentions = torch.stack(
+  [
+    torch.concat((vec, torch.zeros(max_len - vec.shape[0]).to(device))) 
+    for vec in attentions
+  ]
+)
 
+padded_without_prompt = torch.stack(
+  [
+    torch.concat(
+      (
+        vec, torch.zeros(max_len - vec.shape[0]).to(device)
+      )
+    ) for vec in aggregated_attentions
+  ]
+)
 
+print(f"Padded without prompt: {padded_without_prompt.shape}")
 
+sparse = padded_attentions.to_sparse()
+print(f"Sparse shape: {sparse.shape}")
 
-
+response_ids = tokenizer(response)
+print(f"Response tokens: {response_ids['input_ids']}")
+print(f"Response decoded: {[tokenizer.decode(i) for i in response_ids['input_ids']]}")
+fig, ax = plt.subplots(figsize=(36, 12))
+heatmap = ax.pcolor(padded_without_prompt.cpu().numpy(), cmap=plt.cm.Blues, alpha=0.9)
+yticks = [tokenizer.decode(i) for i in response_ids['input_ids']]
+ax.set_yticks(range(0, len(yticks)), minor=False)
+ax.set_yticklabels(yticks) 
+plt.title("Attention heatmap")
+fig.savefig("attention.png")
+plt.close(fig)
 
