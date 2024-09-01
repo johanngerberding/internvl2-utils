@@ -1,4 +1,4 @@
-# InternVL Utils 
+# InternVL2 Utils 
 
 Some useful scripts for InternVL.
 

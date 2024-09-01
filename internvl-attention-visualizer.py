@@ -9,7 +9,7 @@ import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer
 from PIL import Image
-from conversation import get_conv_template 
+from utils.conversation import get_conv_template 
 import matplotlib
 import matplotlib.font_manager
 
